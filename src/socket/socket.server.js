@@ -1,9 +1,16 @@
+require("dotenv").config();
+
 const { Server } = require("socket.io");
 const cookie = require("cookie");
 const jwt = require("jsonwebtoken");
 const User = require("../model/user.model");
-const { generateResponse } = require("../service/ai.service");
+const { generateResponse, generateVector } = require("../service/ai.service");
 const Message = require("../model/message.model");
+const { createMemory, queryMemory } = require("../service/vector.service");
+const {
+  chat,
+} = require("@pinecone-database/pinecone/dist/assistant/data/chat");
+const { text } = require("express");
 
 function initSocketServer(httpServer) {
   const io = new Server(httpServer, {});
@@ -29,36 +36,75 @@ function initSocketServer(httpServer) {
     }
   });
 
-  io.on("connection", (socket) => {
+  io.on("connection", async (socket) => {
     //The message send by the AI will be received here
     socket.on("ai-message", async (data) => {
-
-      await Message.create({
+      const message = await Message.create({
         user: socket.user._id,
         chat: data.chat,
         content: data.content,
         role: "user",
+      });
+
+      const vectors = await generateVector(data.content);
+
+      const memory = await queryMemory({
+        queryVectors: vectors,
+        limit: 3,
+        metadata: {},
       })
+      
+      await createMemory({
+        vectors,
+        messageId: message._id,
+        metadata: {
+          chat: data.chat,
+          user: socket.user._id,
+          text: data.content,
+        },
+      });
+
+
+      console.log(memory);
 
       const chatHistory = await Message.find({
         chat: data.chat,
       })
+        .sort({ createdAt: -1 })
+        .limit(20)
+        .lean();
 
       //Short Term memory implementation
-      const response = await generateResponse(chatHistory.map((item)=>{
-        return {
-          role: item.role,
-          parts: [{
-            text: item.content,
-          }]
-        }
-      }));
+      const response = await generateResponse(
+        chatHistory.map((item) => {
+          return {
+            role: item.role,
+            parts: [
+              {
+                text: item.content,
+              },
+            ],
+          };
+        })
+      );
 
-      await Message.create({
+      const responseMessage = await Message.create({
         user: socket.user._id,
         chat: data.chat,
         content: response,
         role: "model",
+      });
+
+      const responseVector = await generateVector(response);
+
+      await createMemory({
+        vectors: responseVector,
+        messageId: responseMessage._id,
+        metadata: {
+          chat: data.chat,
+          user: socket.user._id,
+          text: response,
+        },
       })
 
       socket.emit("ai-response", {
