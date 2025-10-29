@@ -10,8 +10,6 @@ const authUser = async (req, res, next) => {
         return res.status(401).json({ message: "Unauthorized: No token provided" });
     }
 
-    console.log(token);
-
     try {
         
         const decoded = jwt.verify(token.token , process.env.JWT_SECRET);
@@ -21,7 +19,6 @@ const authUser = async (req, res, next) => {
         next();
 
     } catch (error) {
-        console.log(error);
         res.status(401).json({ message: "Unauthorized: Invalid token" });
     }
 }

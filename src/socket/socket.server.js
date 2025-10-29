@@ -13,11 +13,13 @@ const {
 const { text } = require("express");
 
 function initSocketServer(httpServer) {
+
   const io = new Server(httpServer, {});
 
   // Middleware to parse cookies from the handshake headers
   // For Authentication process of the socket connection
   io.use(async (socket, next) => {
+
     const cookies = cookie.parse(socket.handshake.headers?.cookie || "");
 
     if (!cookies.token) {
@@ -39,21 +41,19 @@ function initSocketServer(httpServer) {
   io.on("connection", async (socket) => {
     //The message send by the AI will be received here
     socket.on("ai-message", async (data) => {
-      const message = await Message.create({
-        user: socket.user._id,
-        chat: data.chat,
-        content: data.content,
-        role: "user",
-      });
 
-      const vectors = await generateVector(data.content);
+      //store user message , generate vector and Store the user message vector in Pinecone concurrently
+      const [message, vectors] = await Promise.all([
+        Message.create({
+          user: socket.user._id,
+          chat: data.chat,
+          content: data.content,
+          role: "user",
+        }),
+        generateVector(data.content),
+      ]);
 
-      const memory = await queryMemory({
-        queryVectors: vectors,
-        limit: 3,
-        metadata: {},
-      })
-      
+
       await createMemory({
         vectors,
         messageId: message._id,
@@ -65,38 +65,64 @@ function initSocketServer(httpServer) {
       });
 
 
-      console.log(memory);
+      const [memory , chatHistory] = await Promise.all([
+        queryMemory({
+           queryVectors: vectors,
+             limit: 3,
+             metadata: {
+               user: socket.user._id,
+             },
+           }),
 
-      const chatHistory = await Message.find({
-        chat: data.chat,
-      })
-        .sort({ createdAt: -1 })
-        .limit(20)
-        .lean();
+           Message.find({
+            chat: data.chat,
+            }).sort({ createdAt: -1 }).limit(20).lean().then(messages => messages.reverse())
+      ])
 
-      //Short Term memory implementation
-      const response = await generateResponse(
-        chatHistory.map((item) => {
-          return {
-            role: item.role,
-            parts: [
-              {
-                text: item.content,
-              },
-            ],
-          };
-        })
-      );
 
-      const responseMessage = await Message.create({
-        user: socket.user._id,
-        chat: data.chat,
-        content: response,
-        role: "model",
+      const stm = chatHistory.map((item) => {
+        return {
+          role: item.role,
+          parts: [
+            {
+              text: item.content,
+            },
+          ],
+        };
       });
 
-      const responseVector = await generateVector(response);
+      const ltm = [
+        {
+          role: "user",
+          parts: [
+            {
+              text: `This is the relevant context from previous conversations:\n\n${memory
+                .map((item) => item.metadata.text)
+                .join("\n")}`,
+            },
+          ],
+        },
+      ];
 
+      const response = await generateResponse([...ltm, ...stm]);
+
+      // Send AI response back to the client
+      socket.emit("ai-response", {
+        content: response,
+        chat: data.chat,
+      });
+
+      const [responseMessage , responseVector] = await Promise.all([
+        Message.create({
+          user: socket.user._id,
+          chat: data.chat,
+          content: response,
+          role: "model",
+        }),
+        generateVector(response),
+      ]);
+
+      // Store the AI response vector in Pinecone
       await createMemory({
         vectors: responseVector,
         messageId: responseMessage._id,
@@ -105,12 +131,9 @@ function initSocketServer(httpServer) {
           user: socket.user._id,
           text: response,
         },
-      })
-
-      socket.emit("ai-response", {
-        content: response,
-        chat: data.chat,
       });
+
+
     });
   });
 }
